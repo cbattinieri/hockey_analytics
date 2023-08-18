@@ -1,0 +1,183 @@
+---
+title: "Battle of the Blueline"
+output:
+  html_document: default
+  pdf_document: default
+date: '2023-05-25'
+---
+
+```{r libraries, include=FALSE}
+library(shiny)
+library(shinyMobile)
+library(apexcharter)
+library(shinyWidgets)
+library(flexdashboard)
+library(hockeyR)
+library(nhlapi)
+library(rlang)
+library(sportyR)
+library(dplyr)
+library(ggimage)
+library(ggplot2)
+library(tidyverse)
+library(data.table)
+library(ggrepel)
+library(ggdark)
+library(gt)
+library(gtExtras)
+library(formattable)
+library(thematic)
+library(shinydashboard)
+library(nhlapi)
+library(highcharter)
+library(nhlapi)
+library(dplyr)
+library(plotly)
+library(rvest)
+library(lubridate)
+library(stringr)
+library(upstartr)
+```
+
+
+
+```{r fetch active roster and pbp}
+
+tc <- hockeyR::team_logos_colors
+
+###active player list from Christian Lee
+active_team_roster_team_info <- nhl_teams_rosters() %>%
+  select(name, abbreviation, teamName, division.name, conference.name)
+
+
+active_team_rosters_list <- nhl_teams_rosters() %>%
+  select(roster.roster) %>%
+  as.list() %>%
+  do.call(c,.) %>%
+  setNames(active_team_roster_team_info$name)
+
+get_active_player_data = function(team_name, list_of_df){
+  temp_df = list_of_df[[team_name]]
+  temp_df$team_name = team_name
+  temp_df = temp_df[,c("person.fullName", "person.id", "position.abbreviation", "position.type", "team_name")]
+  return(temp_df)
+}
+
+full_active_player_list = do.call(rbind, lapply(names(active_team_rosters_list), get_active_player_data, list_of_df=active_team_rosters_list))
+
+pbp <- load_pbp('2022-23')
+
+
+```
+
+
+```{r join roster,position,pbp}
+working_set <- pbp %>% 
+  dplyr::left_join(full_active_player_list, by = c("event_player_1_id" = "person.id"), keep=TRUE)
+
+```
+
+
+# Even Strength corsi attempts, ~blueline giveaways/takeaways
+```{r shot and goal tables}
+
+ind_install <- working_set %>%
+  dplyr::filter(strength_code=='EV') %>% 
+  dplyr::mutate(corsi_ind=ifelse(event== c('Shot', 'Goal', 'Missed Shot', 'Blocked Shot'),"Y","N"),
+                bl_area_ind=ifelse(event==c('Giveaway','Takeaway') & ((x_fixed >= 19 & x_fixed <= 31) | (x_fixed >= -31 & x_fixed <= -19)),"Y","N"),
+                bl_side_ind=ifelse(event_team_type==('home') & bl_area_ind=="Y" & x_fixed>0,"attacking",
+                                   ifelse(event_team_type==('home') & bl_area_ind=="Y" & x_fixed<0,"defending",
+                                          ifelse(event_team_type==('away') & bl_area_ind=="Y" & x_fixed<0,"attacking",
+                                                 ifelse(event_team_type==('away') & bl_area_ind=="Y" & x_fixed>0,"defending","n/a")
+                                                 )
+                                          )
+                                   ),
+                bl_event_type=ifelse(bl_area_ind=="Y",paste0(bl_side_ind," bl ",event),"n/a")
+                )
+
+
+corsi_ta_ga <- ind_install %>% 
+  dplyr::filter(corsi_ind=="Y" | bl_area_ind=="Y")
+
+
+```
+
+
+
+#ga/ta leading to shots
+```{r lead fucntion}
+lead_test <- corsi_ta_ga %>% 
+  mutate(lead_time=lead(period_seconds, n=1L),
+         time_bt=lead_time-period_seconds,
+         lead_event=lead(corsi_ind, n=1L)
+         ) %>% 
+  filter(time_bt <= 10 & bl_area_ind=="Y" & lead_event== "Y") %>%
+  mutate(ga_ta_result=paste0(bl_event_type," leading to shot attempt")
+         )
+         
+
+
+```
+
+
+```{r plot data}
+
+plot_data <- lead_test %>% 
+  mutate(attacking_bl_giveaway=ifelse(bl_event_type=="attacking bl Giveaway",1,0),
+         attacking_bl_takeaway=ifelse(bl_event_type=="attacking bl Takeaway",1,0),
+         defending_bl_giveaway=ifelse(bl_event_type=="defending bl Giveaway",1,0),
+         defending_bl_takeaway=ifelse(bl_event_type=="defending bl Takeaway",1,0)
+         ) %>% 
+  group_by(team_name) %>% 
+  summarise(
+    attk_bl_ga=sum(attacking_bl_giveaway,na.rm = TRUE),
+    attk_bl_ta=sum(attacking_bl_takeaway,na.rm = TRUE),
+    def_bl_ga=sum(defending_bl_giveaway,na.rm = TRUE),
+    def_bl_ta=sum(defending_bl_takeaway,na.rm = TRUE)
+  )
+
+plot_data$logo= tc$team_logo_espn[match(plot_data$team_name,tc$full_team_name)]
+
+```
+
+
+```{r plot}
+plot_data %>%
+  ggplot(aes(x=attk_bl_ga, y=attk_bl_ta)) + 
+  geom_image(aes(image=logo), size=.05, position = "jitter", alpha=.01)+
+  labs(x= "Giveaways (Shot Against)", y="Takwaways (Shot For)", title="Attacking Blueline Events leading to Shot Attempt", subtitle="Giveaway/Takeaway occuring within 6 ft of the Blueline", caption="data scraped from HockeyR package \n NHL definition of giveaway/takeaway")
+
+
+plot_data %>%
+  ggplot(aes(x=def_bl_ga, y=def_bl_ta)) + 
+  geom_image(aes(image=logo), size=.05, position = "jitter", alpha=.01)+
+  labs(x= "Giveaways (Shot Against)", y="Takwaways (Shot For)", title="Defending Blueline Events leading to Shot Attempt", subtitle="Giveaway/Takeaway occuring within 6 ft of the Blueline", caption="data scraped from HockeyR package \n NHL definition of giveaway/takeaway")
+
+```
+
+
+
+
+#Summarise/counts by team
+```{r summary table}
+ga_ta_summary <- corsi_ta_ga %>%
+  group_by(team_name,event_player_1_name) %>% 
+  filter(bl_event_type != "n/a") %>% 
+  count(bl_event_type)
+
+corsi_summary <-corsi_ta_ga %>% 
+  filter(corsi_ind=="Y") %>% 
+  count(event)
+
+bl_summary <-corsi_ta_ga %>% 
+  filter(bl_area_ind=="Y") %>% 
+  count(bl_event_type)
+
+result_event_summary <- lead_test %>%
+  group_by(team_name) %>% 
+  count(ga_ta_result)
+  
+```
+
+
+
