@@ -1,0 +1,482 @@
+---
+title: "big_data_cup_EDA"
+output: html_document
+date: "2024-02-07"
+---
+
+```{r packages}
+library(hockeyR)
+library(fastRhockey)
+library(tidyverse)
+library(nhlapi)
+library(data.table)
+library(lubridate)
+library(readr)
+library(stats)
+library(tidymodels)
+library(ggplot2)
+library(ggpmisc)
+library(readxl)
+library(data.table)
+library(rjson)
+library(pacman)
+library(writexl)
+library(sp)
+library(gt)
+library(gtExtras)
+library(tidyquant)
+```
+
+
+```{r theme}
+gt_theme_538 <- function(data,...) {
+  data %>%
+  opt_all_caps()  %>%
+  opt_table_font(
+    font = list(
+      google_font("Chivo"),
+      default_fonts()
+    )
+  ) %>%
+    tab_style(
+      style = cell_borders(
+        sides = "bottom", color = "transparent", weight = px(2)
+      ),
+      locations = cells_body(
+        columns = TRUE,
+        # This is a relatively sneaky way of changing the bottom border
+        # Regardless of data size
+        rows = nrow(data$`_data`)
+      )
+    )  %>% 
+  tab_options(
+    column_labels.background.color = "white",
+    table.border.top.width = px(3),
+    table.border.top.color = "transparent",
+    table.border.bottom.color = "transparent",
+    table.border.bottom.width = px(3),
+    column_labels.border.top.width = px(3),
+    column_labels.border.top.color = "transparent",
+    column_labels.border.bottom.width = px(3),
+    column_labels.border.bottom.color = "black",
+    data_row.padding = px(3),
+    source_notes.font.size = 12,
+    table.font.size = 16,
+    heading.align = "left",
+    ...
+  ) 
+}
+
+```
+
+
+```{r import/initial manipulation}
+
+bdc_pbp_import <- read.csv("https://raw.githubusercontent.com/bigdatacup/Big-Data-Cup-2024/main/BDC_2024_Womens_Data.csv") %>% 
+  mutate(reg_ind=ifelse(Period > 3,"OT","Reg"),
+         one="id",
+         event_id=row_number(one),
+         goal_center_x = 189,
+         goal_center_y = 42.5) %>% 
+  relocate(event_id, .before=Date) %>% 
+  select(-one)
+
+bdc_pbp_import$period_seconds <- (1200 - (sapply(bdc_pbp_import$Clock, function(x) {
+  time_components <- as.numeric(strsplit(x, ":")[[1]])
+  minutes <- time_components[1]
+  seconds <- time_components[2]
+  total_seconds <- minutes * 60 + seconds
+  return(total_seconds)
+}))) + (ifelse(bdc_pbp_import$Period == 2, 1200,ifelse(bdc_pbp_import$Period == 3, 2400,0)))
+
+
+################5v5 & Regulation PBP
+################ using 189,42.5 as goal center, assuming G skates just inside crease on shot ~4.5 ft. Use to calc to find relative goalie angle rather than just shot
+############angle from goal center
+bdc_pbp_data <-  bdc_pbp_import%>%
+  rename(game_seconds=period_seconds) %>% 
+  mutate(group_seq = data.table::rleid(Team),
+         group_indices = rowid(group_seq),
+    strength_code=ifelse((Home.Team.Skaters == Away.Team.Skaters),"EV","Other"),
+         '5v5_ind'=ifelse((Home.Team.Skaters == 5 & Away.Team.Skaters == 5),"5v5","Other"),
+         evnt_dist_net=round(sqrt((X.Coordinate - goal_center_x)^2 + (Y.Coordinate - goal_center_y)^2),2),
+         rel_event_x=X.Coordinate-goal_center_x,
+         rel_event_y=Y.Coordinate-goal_center_y,
+         evnt_angle= round(180-abs(atan2(rel_event_y,rel_event_x)*180/ pi),0),
+         poss_change=ifelse(Team== lag(Team, n=1L), NA,paste0("poss_change",cumsum(Team != lag(Team, default = first(Team))))),
+         evnt_strt_zone=ifelse(X.Coordinate > 149, "OZ",
+                               ifelse(X.Coordinate > 101, "NZ",
+                                      ifelse(X.Coordinate > 0, "DZ", NA)
+                               )
+         ),
+         evnt_end_zone=ifelse(X.Coordinate.2 > 149, "OZ",
+                               ifelse(X.Coordinate.2 > 101, "NZ",
+                                      ifelse(X.Coordinate.2 > 0, "DZ", NA)
+                               )
+         ),
+         'evnt_zn(s)'=ifelse(is.na(evnt_end_zone),evnt_strt_zone,paste0(evnt_strt_zone,"->",evnt_end_zone)),
+         prv_evnt_time_diff=(game_seconds- lag(game_seconds, n=1L)),
+         ########cross ice event from prev event (within 4 secs)
+         cross_ice_event_ind=ifelse(((Y.Coordinate <= 42.5 & lag(Y.Coordinate, n=1L) > 42.5) | (Y.Coordinate >= 42.5 & lag(Y.Coordinate, n=1L) < 42.5)) & prv_evnt_time_diff <= 4, "cross_ice", "non_ci"),
+         ########rr pass in same 'event'
+         rr_pass_ind=ifelse((Y.Coordinate <= 42.5 &  Y.Coordinate.2 > 42.5) | (Y.Coordinate >= 42.5 &  Y.Coordinate.2 < 42.5), "RR_pass", "non_RR_pass"),
+         cross_ice_or_rr_pass=ifelse(Event == 'Play',(ifelse((Y.Coordinate <= 42.5 &  Y.Coordinate.2 > 42.5) | (Y.Coordinate >= 42.5 &  Y.Coordinate.2 < 42.5), "RR_pass", "non_RR_pass")),(ifelse(((Y.Coordinate <= 42.5 & lag(Y.Coordinate, n=1L) > 42.5) | (Y.Coordinate >= 42.5 & lag(Y.Coordinate, n=1L) < 42.5)) & prv_evnt_time_diff <= 4, "cross_ice", "non_ci"))),
+         detailed_event=paste0(Event,"-",Detail.1,ifelse(is.na(rr_pass_ind),"",paste0("-",rr_pass_ind))),
+         detailed_event2=paste0(Event,"-",Detail.1),
+         shot_prev_event=ifelse(Event %in% c('Shot','Goal'), lag(detailed_event2, n=1L),NaN),
+         shot_prev_event_x.coord=as.numeric(ifelse(Event %in% c('Shot','Goal'), lag(X.Coordinate, n=1L),NaN)),
+         shot_prev_event_y.coord=as.numeric(ifelse(Event %in% c('Shot','Goal'), lag(Y.Coordinate, n=1L),NaN)),
+         shot_prev_event_angle=round(180-abs(atan2((shot_prev_event_y.coord-goal_center_y),(shot_prev_event_x.coord-goal_center_x))*180/ pi),0),
+         shot_prev_event_rr_ind=ifelse(Event %in% c('Shot','Goal'), lag(cross_ice_or_rr_pass, n=1L),NA),
+         Detail.3.xG=ifelse(Detail.3=='t',.10,0),
+         Detail.1.xG=ifelse(Detail.1=='Deflection',.08,0),
+         shot_prev_evnt_xG=ifelse(shot_prev_event_rr_ind=='RR_pass',.22,
+                                  ifelse(shot_prev_event_rr_ind=='cross_ice',.08,
+                                    ifelse(shot_prev_event_rr_ind=='non_rr_pass' & Detail.4=='t',.09,0)
+                                  )
+                                  ),
+         ###############check conditions in shot_prev_event
+         xG=Detail.3.xG++Detail.1.xG+shot_prev_evnt_xG
+         ) %>% 
+  relocate(detailed_event2,.before = evnt_strt_zone) %>% 
+  relocate(group_seq,.after = Team) %>% 
+  select(-detailed_event,-cross_ice_event_ind,-rr_pass_ind,-goal_center_y,-goal_center_x, -rel_event_x, -rel_event_y)%>% 
+  filter(reg_ind == 'Reg' & !!as.name('5v5_ind') != "Other"
+         ) %>% 
+  rename(corsi_ind=Detail.2,
+         traffic_ind=Detail.3,
+         oneT_ind=Detail.4)
+
+
+```
+
+
+```{r recovery to entry time pbp}
+
+entry_time_pbp <- bdc_pbp_data %>% 
+  filter(Event %in% c('Puck Recovery', 'Takeaway', 'Zone Entry'))%>% 
+  group_by(group_seq) %>% 
+  mutate(group_indices = rowid(group_seq),############### <------------ row for groups rather than entire pbp// need to switch to max zone entry
+        max_grp_index=max(group_indices[Event== 'Zone Entry']),
+        max_grp_evnt_seconds=game_seconds[match(max_grp_index,group_indices)],
+        poss_strt_seconds=game_seconds[match(max_grp_index-1,group_indices)], 
+        poss_start_zn=evnt_strt_zone[match(max_grp_index-1,group_indices)], 
+        poss_start_coord=X.Coordinate[match(max_grp_index-1,group_indices)], 
+        entry_coord.x=ifelse(Event=='Zone Entry',X.Coordinate,NaN),
+        entry_coord.y=ifelse(Event=='Zone Entry',Y.Coordinate,NaN),
+        entry_time=ifelse(Event=='Zone Entry',max_grp_evnt_seconds-poss_strt_seconds,NaN)) %>% 
+  relocate(entry_time, .after = game_seconds) %>% 
+  ungroup() 
+
+
+bdc_pbp_data2 <- entry_time_pbp %>% 
+  select(event_id,entry_time, poss_start_zn, poss_start_coord,entry_coord.x,entry_coord.y)
+
+
+bdc_join1 <- left_join(bdc_pbp_data, bdc_pbp_data2, by= "event_id")
+
+ ##############be clear on what columns are really looking at 
+```
+
+```{r recovery/entry/shot pbp}
+
+
+##########test using above table to entry time and type align
+entry_shot_pbp <- bdc_join1 %>% 
+  filter(Event %in% c('Puck Recovery', 'Takeaway', 'Zone Entry', 'Shot', 'Goal')) %>% 
+  group_by(group_seq) %>% 
+  mutate(prv_evnt_time_diff2=game_seconds-lag(game_seconds, n=1L),
+  entry_shot_ind=ifelse(Event %in% c('Shot','Goal') & (lag(Event, n=1L)=='Zone Entry') & prv_evnt_time_diff2 <= 4,shot_prev_event,NA),
+  entry_shot_time=ifelse(Event %in% c('Shot','Goal') & (lag(Event, n=1L)=='Zone Entry') & prv_evnt_time_diff2 <= 4,lag(entry_time, n=1L),NA),
+  poss_start_zn2=ifelse(Event %in% c('Shot','Goal') & (lag(Event, n=1L)=='Zone Entry') & prv_evnt_time_diff2 <= 4,lag(poss_start_zn, n=1L),NA),
+  poss_start_coord2=ifelse(Event %in% c('Shot','Goal') & (lag(Event, n=1L)=='Zone Entry') & prv_evnt_time_diff2 <= 4,lag(poss_start_coord, n=1L),NA),
+  entry_coord.x2=ifelse(Event %in% c('Shot','Goal') & (lag(Event, n=1L)=='Zone Entry') & prv_evnt_time_diff2 <= 4,lag(entry_coord.x, n=1L),NA),
+  entry_coord.y2=ifelse(Event %in% c('Shot','Goal') & (lag(Event, n=1L)=='Zone Entry') & prv_evnt_time_diff2 <= 4,lag(entry_coord.y, n=1L),NA),
+  entry_angle=ifelse(Event %in% c('Shot','Goal') & (lag(Event, n=1L)=='Zone Entry') & prv_evnt_time_diff2 <= 4,lag(evnt_angle, n=1L),NA),
+  entry_location=ifelse(entry_coord.y2 < 17 ,"outside_left",
+                        ifelse(entry_coord.y2 < 34 ,"middle_left",
+                               ifelse(entry_coord.y2 < 51 ,"middle",
+                                      ifelse(entry_coord.y2 < 68 ,"middle_right",
+                                             ifelse(entry_coord.y2 <= 85 ,"outside_right","n/a")
+                                             )
+                                      )
+                               )
+                        )
+  )%>% 
+  mutate(entry_shot_time2=ifelse(entry_shot_time==0,0.5,entry_shot_time)) %>% 
+  ungroup()%>% 
+  filter(entry_shot_ind != "n/a")
+
+
+# entry_shot_pbp <- bdc_pbp_data %>% 
+#   filter(Event %in% c('Puck Recovery', 'Takeaway', 'Zone Entry', 'Shot', 'Goal')) %>% 
+#   group_by(group_seq) %>% 
+#   mutate(prv_evnt_time_diff2=game_seconds-lag(game_seconds, n=1L),
+#   entry_shot_ind=ifelse(Event %in% c('Shot','Goal') & (lag(Event, n=1L)=='Zone Entry') & prv_evnt_time_diff2 <= 4,shot_prev_event,"n/a")) %>% 
+#   ungroup() %>% 
+#   filter(entry_shot_ind != "n/a")
+# 
+# 
+# bdc_pbp_data3 <- entry_shot_pbp %>% 
+#   select(event_id,entry_shot_ind)
+
+##############be clear on what columns are really looking at 
+##################shot has to come within 4 seconds of entry!!!!!!!!!!!!
+
+```
+
+```{r finalized table}
+
+breaks <- seq(-180, 180, by = 45)
+speed_breaks <- seq(0,35, by=5)
+degrees_breaks <- seq(0,65, by= 10)
+
+bdc_pbp_final <- entry_shot_pbp %>% 
+  select(-Player.2:-Y.Coordinate.2,
+         -group_indices,-poss_change,-evnt_end_zone,-`evnt_zn(s)`,
+         -entry_time:-entry_coord.y,-entry_shot_time) %>% 
+  mutate(fps=(entry_coord.x2-poss_start_coord2)/entry_shot_time2,
+         angle_delta=ifelse(shot_prev_event_rr_ind == 'cross_ice',evnt_angle+entry_angle, ifelse(shot_prev_event_rr_ind == 'RR_pass',evnt_angle+shot_prev_event_angle+entry_angle, abs(evnt_angle-entry_angle))),
+         dgs_per_sec=round(angle_delta/entry_shot_time2,2),
+         angle_bucket=cut(angle_delta, breaks = breaks, labels = c("-180 to -135", "-135 to -90", "-90 to -45", "-45 to 0", "0 to 45", "45 to 90", "90 to 135", "135 to 180")),
+         speed_bucket=cut(fps, breaks = speed_breaks, labels = c("0 to 5", "5 to 10", "10 to 15", "15 to 20", "20 to 25", "25 to 30", "30 to 35")),
+         dps_bucket=cut(dgs_per_sec, breaks = degrees_breaks, labels = c("0 to 10", "10 to 20", "20 to 30", "30 to 40", "40 to 50", "50 to 60"))
+         )
+
+
+
+```
+
+
+```{r write}
+bdc_summarize_speed <- bdc_pbp_final %>% 
+  group_by(speed_bucket) %>% 
+  summarise(one_timers=sum(oneT_ind=="t"),
+            screens=sum(traffic_ind=="t"),
+            royal_road_passes=sum(shot_prev_event_rr_ind=='RR_pass'),
+            royal_road_carries=sum(shot_prev_event_rr_ind=='cross_ice'),
+            same_side_oneT=sum(shot_prev_event_rr_ind=='RR_pass'&oneT_ind=="t"),
+            xG=sum(xG),
+            xGperEvent=round(sum(xG)/(screens+royal_road_passes+royal_road_carries+same_side_oneT),2)) %>% 
+   gt() %>% 
+  tab_spanner(
+    label = "EVENTS BY ENTRY SPEED",
+    columns = vars(screens, royal_road_passes, royal_road_carries)
+  ) %>% 
+        tab_options(table.width=pct(80)) %>%
+          #gt_img_rows(' ') %>%
+          cols_align(align='center', columns = everything()) %>%
+  gt_color_rows(xG) %>%
+          gt_theme_538()
+
+bdc_summarize_speed %>% 
+  gtsave("entryspeed.png")
+
+bdc_summarize_angle_delta <- bdc_pbp_final %>% 
+  group_by(angle_bucket) %>% 
+  summarise(one_timers=sum(oneT_ind=="t"),
+            screens=sum(traffic_ind=="t"),
+            royal_road_passes=sum(shot_prev_event_rr_ind=='RR_pass'),
+            royal_road_carries=sum(shot_prev_event_rr_ind=='cross_ice'),
+            same_side_oneT=sum(shot_prev_event_rr_ind=='RR_pass'&oneT_ind=="t"),
+            xG=sum(xG),
+            xGperEvent=round(sum(xG)/(screens+royal_road_passes+royal_road_carries+same_side_oneT),2))%>% 
+   gt() %>% 
+  tab_spanner(
+    label = "EVENTS BY DEGREES OF PUCK MOVEMENT",
+    columns = vars(screens, royal_road_passes, royal_road_carries)
+  ) %>% 
+        tab_options(table.width=pct(80)) %>%
+          #gt_img_rows(' ') %>%
+          cols_align(align='center', columns = everything()) %>% 
+  gt_color_rows(xG) %>%
+          gt_theme_538()
+
+bdc_summarize_angle_delta %>% 
+  gtsave("angledelta.png")
+
+bdc_summarize_location <- bdc_pbp_final %>% 
+  group_by(entry_location) %>% 
+  summarise(one_timers=sum(oneT_ind=="t"),
+            screens=sum(traffic_ind=="t"),
+            royal_road_passes=sum(shot_prev_event_rr_ind=='RR_pass'),
+            royal_road_carries=sum(shot_prev_event_rr_ind=='cross_ice'),
+            same_side_oneT=sum(shot_prev_event_rr_ind=='RR_pass'&oneT_ind=="t"),
+            xG=sum(xG),
+            xGperEvent=round(sum(xG)/(screens+royal_road_passes+royal_road_carries+same_side_oneT),2))%>% 
+   gt() %>% 
+  tab_spanner(
+    label = "EVENTS BY ENTRY LOCATION",
+    columns = vars(screens, royal_road_passes, royal_road_carries)
+  ) %>% 
+        tab_options(table.width=pct(80)) %>%
+          #gt_img_rows(' ') %>%
+          cols_align(align='center', columns = everything()) %>% 
+          gt_color_rows(xG) %>% 
+          gt_theme_538()
+        
+
+bdc_summarize_location %>% 
+  gtsave("entrylocation.png")
+
+
+bdc_summarize_dps <- bdc_pbp_final %>% 
+  group_by(dps_bucket) %>% 
+  summarise(one_timers=sum(oneT_ind=="t"),
+            screens=sum(traffic_ind=="t"),
+            royal_road_passes=sum(shot_prev_event_rr_ind=='RR_pass'),
+            royal_road_carries=sum(shot_prev_event_rr_ind=='cross_ice'),
+            same_side_oneT=sum(shot_prev_event_rr_ind=='RR_pass'&oneT_ind=="t"),
+            xG=sum(xG),
+            xGperEvent=round(sum(xG)/(screens+royal_road_passes+royal_road_carries+same_side_oneT),2))%>% 
+   gt() %>% 
+  tab_spanner(
+    label = "EVENTS BY DEGREES OF MOVEMENT PER SECOND",
+    columns = vars(screens, royal_road_passes, royal_road_carries)
+  ) %>% 
+        tab_options(table.width=pct(80)) %>%
+          #gt_img_rows(' ') %>%
+          cols_align(align='center', columns = everything()) %>% 
+          gt_color_rows(xG) %>% 
+          gt_theme_538()
+        
+
+bdc_summarize_dps %>% 
+  gtsave("entrydps.png")
+
+```
+
+
+
+```{r HD chance test}
+
+
+```
+
+```{r EDA}
+speed_angles <- ggplot(data=bdc_pbp_final,aes(color=corsi_ind))+
+  geom_point(aes(x=fps, y=angle_delta))
+
+speed_angles
+
+speed_angles2 <- ggplot(data=bdc_pbp_final,aes(color=oneT_ind, shape=entry_location))+
+  geom_point(aes(x=fps, y=angle_delta))
+
+speed_angles2
+
+
+ggplot(bdc_pbp_final,aes(x=speed_bucket, fill=shot_prev_event_rr_ind))+
+  geom_histogram(stat="count",  col="white",width=1)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        )
+
+```
+
+
+```{r EDA}
+#####shot attempts
+pre_shot_hist <- bdc_pbp_data %>% 
+  filter(shot_prev_event != "n/a",
+         prv_evnt_time_diff > -1)
+
+?shift
+
+########drill down into cross ice
+
+cross_ice_drilldown <- bdc_pbp_data %>% 
+  filter(shot_prev_event != "n/a",
+         #shot_prev_event_rr_ind == 'cross_ice'
+         )
+
+
+##############shot by previous event  
+ggplot(bdc_pbp_final,aes(x=oneT_ind, fill="black"))+
+  geom_histogram(stat="count",  col="white",width=1)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        )+
+  facet_wrap(~speed_bucket, nrow=1)
+
+#############event by rr_ind by prev event type
+ggplot(pre_shot_hist,aes(x=shot_prev_event_rr_ind, fill="blue"))+
+  geom_histogram(stat="count",  col="white",width=1)+
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -.5, size = 3) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        )
+
+#############event by rr_ind by prev event type
+ggplot(pre_shot_hist,aes(x=shot_prev_event_rr_ind, fill=Event))+
+  geom_histogram(stat="count",  col="white",width=1)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        )+
+  facet_wrap(~shot_prev_event, nrow=2)
+
+######time from previous event to shot
+ggplot(pre_shot_hist,aes(x=prv_evnt_time_diff))+
+  geom_histogram(stat="count",  col="black",width=1)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        )
+
+######entry types that led to shots
+ggplot(entry_shot_pbp,aes(x=entry_shot_ind, fill=Event))+
+  geom_histogram(stat="count",  col="white",width=1)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        )
+
+######shots by time to entry
+ggplot(bdc_pbp_final,aes(x=entry_shot_time, fill=Event))+
+  geom_histogram(stat="count",  col="white",width=1)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        )+
+  facet_wrap(~shot_prev_event, nrow=1)
+
+?geom_histogram
+#####layer in high danger in event and if shot was carried or dumped not necessarily 'prev event'
+
+
+```
+
+
+```{r plot}
+
+plot_test <- ggplot(data=bdc_pbp_final,aes(color=shot_prev_event_rr_ind,shape=Event,size=2.5))+
+  geom_point(aes(x=X.Coordinate, y=Y.Coordinate))+
+  geom_point(aes(x=shot_prev_event_x.coord, y=shot_prev_event_y.coord))
+  geom_line(aes(x = c(X.Coordinate, shot_prev_event_x.coord), 
+                y = c(Y.Coordinate, shot_prev_event_y.coord)), color = "black")
+
+plot_test
+
+movement_v_speed <- ggplot(data=bdc_pbp_final,aes(color=Event,shape=shot_prev_event_rr_ind,size=.5))+
+  geom_point(aes(x=fps,y=angle_delta))+
+  theme(legend.position="bottom" )+
+  ggtitle('Degrees of Movement vs. Entry Speed')+
+  guides(
+    shape = guide_legend(ncol = 2),
+    size = FALSE
+  )+
+  labs(x= "Feet per Second", y="Degrees",shape = "Prev Event")
+  
+ggsave("movement_v_speed.png", width = 10, height = 7)
+
+# Create a new dataframe with the coordinates from the same row
+line_data <- data.frame(
+  x = pre_shot_hist$X.Coordinate,
+  y = pre_shot_hist$Y.Coordinate,
+  xend = pre_shot_hist$shot_prev_event_x.coord,
+  yend = pre_shot_hist$shot_prev_event_y.coord,
+  Event = pre_shot_hist$Event,
+  prev_event= pre_shot_hist$shot_prev_event_rr_ind
+)
+
+line_data
+
+ggplot(data = pre_shot_hist, aes(color = Event)) +
+  geom_point(aes(x = X.Coordinate, y = Y.Coordinate)) +
+  geom_point(aes(x = shot_prev_event_x.coord, y = shot_prev_event_y.coord)) +
+  geom_segment(data = line_data, aes(x = x, y = y, xend = xend, yend = yend, color = Event))+
+  facet_wrap(~prev_event, nrow=2)
+
+
+```
+
+
